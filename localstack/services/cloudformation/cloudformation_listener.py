@@ -1,6 +1,7 @@
 import re
 import uuid
 import logging
+import xmltodict
 from requests.models import Response
 from six.moves.urllib import parse as urlparse
 from localstack.utils.aws import aws_stack
@@ -100,6 +101,39 @@ class ProxyListenerCloudFormation(ProxyListener):
                       (response.status_code, method, path, response.content))
         if response._content:
             aws_stack.fix_account_id_in_arns(response)
+        req_data = None
+        if method == 'POST' and path == '/':
+            req_data = urlparse.parse_qs(to_str(data))
+            action = req_data.get('Action')[0]
+        if req_data:
+            response_dict = xmltodict.parse(response.content, force_list=('member'))
+            resources = []
+            if action == 'DescribeStackEvents':
+                resources = response_dict['DescribeStackEventsResponse']['DescribeStackEventsResult']['StackEvents']['member']
+            if action == 'DescribeStackResource':
+                resources = [response_dict['DescribeStackResourceResponse']['DescribeStackResourceResult']['StackResourceDetail']]
+            if action == 'DescribeStackResources':
+                resources = response_dict['DescribeStackResourcesResponse']['DescribeStackResourcesResult']['StackResources']['member']
+            if action == 'ListStackResources':
+                resources = response_dict['ListStackResourcesResponse']['ListStackResourcesResult']['StackResourceSummaries']['member']
+            if len(resources) > 0:
+                sqs_client = aws_stack.connect_to_service('sqs')
+                content_str = content_str_original = to_str(response.content)
+                new_response = Response()
+                new_response.status_code = response.status_code
+                new_response.headers = response.headers
+                for resource in resources:
+                    if resource['ResourceType'] == 'AWS::SQS::Queue':
+                        try:
+                            queue_name = resource['PhysicalResourceId']
+                            queue_url = sqs_client.get_queue_url(QueueName=queue_name)['QueueUrl']
+                        except:
+                            stack_name = req_data.get('StackName')[0]
+                        content_str = re.sub(resource['PhysicalResourceId'], queue_url, content_str)
+                new_response._content = content_str
+                if content_str_original != new_response._content:
+                    new_response.headers['content-length'] = len(new_response._content)
+                    return new_response
 
     def _list_stack_names(self):
         client = aws_stack.connect_to_service('cloudformation')
